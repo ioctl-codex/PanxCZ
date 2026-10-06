@@ -188,6 +188,41 @@ What the build does now:
   the level the ROM itself runs, so there is no LTS gap left. Verifying on-device
   (both ROM builds) is still the only way to actually prove it.
 
+## Packaging (AnyKernel3)
+
+The zip is assembled by `scripts/make-anykernel3.sh`, which can be re-run on its
+own against an existing `Image` — no kernel rebuild needed:
+
+```bash
+AK_IMAGE=/opt/panxcz/out-artifacts/Image AK_KVER=5.10.269 \
+AK_OUTDIR=/opt/panxcz/out-artifacts bash scripts/make-anykernel3.sh
+```
+
+Artifact name follows the Aetherium convention:
+
+```
+<Name><release>-<kernel>-<flavor>-<root>-<hiding>-<perf>-<date>-<n>.zip
+PanxCZ4.0-5.10-269-full-allin-BakaSU-SuSFS-BBRv3-20261006-1.zip
+```
+
+Two upstream-AnyKernel3 traps the script exists to avoid, both of which produce
+a zip that cannot be flashed at all:
+
+1. **The zip must have `META-INF/`, `anykernel.sh`, `tools/` and `Image` at the
+   zip root.** Zipping the checkout directory nests them under `anykernel/`, and
+the recovery then cannot find `META-INF/com/google/android/update-binary`, so
+the install aborts before it starts. (v10 shipped exactly like this — the first
+zip had to be rebuilt and replaced.)
+2. **`anykernel.sh` must be rewritten for the device.** Upstream's copy still
+   targets maguro/toro/tuna (Galaxy Nexus) with
+`BLOCK=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot`. The X6833B is GKI
+with A/B slots, so it needs `BLOCK=boot` + `IS_SLOT_DEVICE=1` for `ak3-core.sh`
+to resolve `/dev/block/by-name/boot$SLOT`. The kernel goes in `boot`; the generic
+ramdisk lives in `init_boot`, which is left alone.
+
+Both `Image` and `Image.gz` are shipped — this device's boot partition holds a
+gzip-compressed kernel and magiskboot picks whichever it finds.
+
 ## Where the builds live
 
 * Build system + CI: **https://github.com/ioctl-codex/PanxCZ**

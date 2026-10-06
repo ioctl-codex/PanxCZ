@@ -82,6 +82,7 @@ LTS_BASE_BRANCH="${LTS_BASE_BRANCH:-panxcz-base-5.10.269}"
 LTS_SOURCE_BRANCH="${LTS_SOURCE_BRANCH:-chihiro-lnx-stable}"
 WORKDIR="${WORKDIR:-/opt/panxcz}"
 BUILD_NUM="${BUILD_NUM:-$(date -u +%Y%m%d%H%M)}"
+BUILD_N="${BUILD_N:-1}"      # trailing counter in the Aetherium-style zip name
 SWAP_GB="${SWAP_GB:-8}"
 
 EXTRA="-${KERNEL_NAME}-${KERNEL_RELEASE}.${BUILD_NUM}"
@@ -460,24 +461,24 @@ grep -q '^CONFIG_DEFAULT_TCP_CONG="bbr3"' "${OCFG}" 2>/dev/null \
   && echo "OK: BBRv3 is the default congestion control" \
   || warn "BBRv3 is not the default congestion control"
 
-rm -rf "${WORKDIR}/anykernel"
-git clone --depth 1 https://github.com/osm0sis/AnyKernel3.git "${WORKDIR}/anykernel"
-cd "${WORKDIR}/anykernel"
-rm -rf .git .github
-KSTR="${KERNEL_NAME} Kernel (${KERNEL_CODENAME}-based) for ${DEVICE_MODEL} by ${KERNEL_NAME}"
-sed -i "s|^kernel.string=.*|kernel.string=${KSTR}|" anykernel.sh
-sed -i "s|^do.devicecheck=.*|do.devicecheck=0|" anykernel.sh
-printf '%s\n' \
-  "id=${KERNEL_NAME}" \
-  "name=${KERNEL_NAME} Kernel" \
-  "version=v${KERNEL_RELEASE}.${BUILD_NUM}" \
-  "versionCode=${BUILD_NUM}" \
-  "author=${KERNEL_NAME}" \
-  "description=Base ${BASE_NAME} + BakaSU + SUSFS (credits: MillenniumOSS, Aetherium/kaminarich, BakaSU) for ${DEVICE_PLATFORM}" \
-  > module.prop
-cp "${IMAGE}" ./Image
-cd "${WORKDIR}"
-zip -r9 "${OUTDIR}/${ZIPNAME}" anykernel -x '*.git*' >/dev/null
+# --- AnyKernel3 -------------------------------------------------------------
+# Packaging lives in its own script (scripts/make-anykernel3.sh) so the zip can
+# be regenerated from an existing Image without re-running a 40-minute build.
+# It rewrites anykernel.sh for this device (upstream's still targets
+# maguro/toro/tuna with an omap BLOCK path; here we need BLOCK=boot +
+# IS_SLOT_DEVICE=1) and puts the zip contents at the zip ROOT instead of
+# nesting them under anykernel/ - the latter is what made v10 unflashable.
+AK_SCRIPT="${SCRIPT_DIR}/make-anykernel3.sh"
+[ -f "${AK_SCRIPT}" ] || die "${AK_SCRIPT} is missing from the payload"
+AK_IMAGE="${IMAGE}" AK_KVER="${KVER}" AK_OUTDIR="${OUTDIR}" AK_WORKDIR="${WORKDIR}" \
+AK_NAME="${KERNEL_NAME}" AK_RELEASE="${KERNEL_RELEASE}" AK_VARIANT="${VARIANT}" \
+AK_CODENAME="${KERNEL_CODENAME}" AK_BASE_NAME="${BASE_NAME}" \
+AK_BUILD_N="${BUILD_N}" AK_DEVICE_MODEL="${DEVICE_MODEL}" \
+AK_DEVICE_PLATFORM="${DEVICE_PLATFORM}" \
+  bash "${AK_SCRIPT}" || die "AnyKernel3 packaging failed"
+ZIPNAME="$(cat "${OUTDIR}/.zipname")"
+[ -f "${OUTDIR}/${ZIPNAME}" ] || die "AnyKernel3 zip was not produced"
+echo "OK: AnyKernel3 zip = ${ZIPNAME}"
 ls -lh "${OUTDIR}"
 
 cat > "${OUTDIR}/summary.txt" <<EOF
