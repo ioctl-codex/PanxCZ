@@ -1,0 +1,4 @@
+*.zip
+*.tmp
+.tmp-askpass.sh
+.analysis/

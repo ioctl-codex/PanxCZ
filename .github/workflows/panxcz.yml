@@ -1,0 +1,148 @@
+name: PanxCZ Kernel Build
+
+# Drives scripts/build-panxcz.sh, which does the whole pipeline:
+#   AOSP manifest (build/ + prebuilts)
+#     -> 5.10.269 base (chihiro-lnx-stable merged with AOSP android12-5.10-lts,
+#        created on the runner by scripts/make-base-269.sh)
+#     -> BBRv3 (patches/bbrv3-chihiro.patch)
+#     -> BakaSU (SUSFS is a first-class hook method there: CONFIG_KSU_SUSFS)
+#     -> simonpunk's SUSFS kernel-side patch (fs/susfs.c + the ksu_handle_* hooks)
+#     -> LTO=thin build -> Image + AnyKernel3 zip
+#
+# Keeping the logic in the script (not in YAML) is deliberate: the same script
+# runs on the VPS, so CI and local builds cannot drift apart.
+#
+# This repo holds only the build system; the kernel source is fetched by the
+# script itself, so the checkout here is tiny.
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Variant'
+        required: true
+        default: 'A-full-allin'
+        type: choice
+        options: [A-full-allin, B-susfs-hiding, C-charging-gaming]
+      kernel_release:
+        description: 'Kernel release (used in the version string)'
+        required: true
+        default: '4.0'
+      lto:
+        description: 'LTO mode'
+        required: true
+        default: 'thin'
+        type: choice
+        options: [thin, none, full]
+      bbrv3:
+        description: 'BBRv3: yes = fail the build if it cannot be applied'
+        required: true
+        default: 'yes'
+        type: choice
+        options: [yes, auto, no]
+      lts_merge:
+        description: 'Create/use the 5.10.269 base (AOSP LTS merge)'
+        required: true
+        default: 'yes'
+        type: choice
+        options: [yes, no]
+      publish_release:
+        description: 'Publish a GitHub release with the artifacts'
+        required: true
+        default: true
+        type: boolean
+  push:
+    branches: [main, panxcz]
+    paths:
+      - 'scripts/**'
+      - 'patches/**'
+      - '.github/workflows/panxcz.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 330
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The kernel tree + AOSP prebuilts need far more than the default ~14 GB.
+      - name: Maximise build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      - name: Show runner
+        run: |
+          nproc; free -h; df -h /
+
+      - name: Build
+        env:
+          VARIANT: ${{ inputs.variant || 'A-full-allin' }}
+          KERNEL_RELEASE: ${{ inputs.kernel_release || '4.0' }}
+          LTO_MODE: ${{ inputs.lto || 'thin' }}
+          BBRV3: ${{ inputs.bbrv3 || 'yes' }}
+          LTS_MERGE: ${{ inputs.lts_merge || 'yes' }}
+          WORKDIR: /opt/panxcz
+        run: |
+          set -euo pipefail
+          # The script expects patches/ next to scripts/, which is the case here.
+          sudo -E bash scripts/build-panxcz.sh
+          echo "--- verification (must not be empty) ---"
+          O=/opt/panxcz/gki/out/android12-5.10/common
+          for p in bbr3 susfs; do
+            n=$(grep -ic "$p" "$O/System.map" || true)
+            echo "$p symbols: $n"
+            [ "$n" -gt 0 ] || { echo "::error::$p missing from System.map"; exit 1; }
+          done
+          grep -E '^CONFIG_(TCP_CONG_BBR3|KSU_SUSFS)=y' "$O/.config"
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          cp -f /opt/panxcz/out-artifacts/Image dist/ || true
+          cp -f /opt/panxcz/out-artifacts/*.zip dist/ || true
+          cp -f /opt/panxcz/out-artifacts/summary.txt dist/ || true
+          cp -f /opt/panxcz/gki/out/android12-5.10/common/System.map dist/ || true
+          cp -f /opt/panxcz/gki/out/android12-5.10/common/.config dist/config.txt || true
+          ls -lh dist
+
+      - name: Show summary
+        run: cat dist/summary.txt 2>/dev/null || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: PanxCZ-${{ inputs.kernel_release || '4.0' }}
+          path: dist/*
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Publish release
+        if: ${{ (inputs.publish_release == true) || (github.event_name == 'push') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: panxcz-${{ inputs.kernel_release || '4.0' }}-${{ github.run_number }}
+          name: PanxCZ ${{ inputs.kernel_release || '4.0' }} (5.10.269, KMI gen 9)
+          body: |
+            PanxCZ kernel for the Infinix Note 30 (X6833B) — MediaTek Helio G99 (MT6789).
+
+            Base: MillenniumOSS Chihiro `chihiro-lnx-stable` merged with AOSP
+            `android12-5.10-lts` → **5.10.269**, KMI generation 9.
+            Root: BakaSU (multi-manager) · Hiding: SUSFS · Congestion control: BBRv3.
+
+            Credit: kernel work belongs to MillenniumOSS (Chihiro), Aetherium
+            (kaminarich), BakaSU, SUSFS and upstream Linux/AOSP. PanxCZ is a
+            rebrand + integration layer only.
+          files: dist/*
+          fail_on_unmatched_files: false
