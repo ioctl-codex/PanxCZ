@@ -63,7 +63,8 @@ summary.txt
 | v4 | `chihiro-rebase` + BBRv3 patch | ❌ `tp->plb_rehash` missing — patch wrongly replaced `include/linux/tcp.h` |
 | v5 | `chihiro-lnx-stable` (5.10.264) + BBRv3 + BakaSU + SUSFS | ❌ built, but **SUSFS was absent** (`System.map` had 0 `susfs` symbols) |
 | v9 | `panxcz-base-5.10.269` + BBRv3 + SUSFS KernelSU patch | ❌ `sucompat.c: assigning to 'int' from incompatible type 'void'` |
-| **v10** | `panxcz-base-5.10.269` + BBRv3 + **BakaSU `main`** + SUSFS | ✅ **`5.10.269-PanxCZ-4.0.202610060802`** — Image 37 MB, AnyKernel3 19 MB, 27 `bbr3` + **89 `susfs`** symbols |
+| **v10** | `panxcz-base-5.10.269` + BBRv3 + **BakaSU `main`** + SUSFS | ⚠️ **`5.10.269-PanxCZ-4.0.202610060802`** built (27 `bbr3` + **89 `susfs`** symbols) but **bootloops on device** — BBRv3 was the default cc |
+| **v11** | v10 with BBRv3 **no longer the default cc** (`westwood`, as the stock base) and `HZ` back to 250 | ✅ builds — see "v10 bootloops" below |
 
 ### Base selection
 
@@ -147,7 +148,59 @@ What the build does now:
 
 ## Known integration issues / notes
 
-* **BBRv3 — RESOLVED.** Aetherium's BBRv3 is a single **kitchen-sink commit**: it
+* **v10 bootloops on device — root cause: BBRv3 as the default congestion control.**
+  Flashing v10 (both the hand-packed `boot` image and the AnyKernel3 zip) put the
+  phone into a reboot loop. There is no log from the v10 kernel itself, but the
+  crash is unambiguous — pstore (`/sys/fs/pstore/console-ramoops-0`, dumped as
+  root) held an Oops in `bbr3_main`:
+
+  ```
+  Unable to handle kernel NULL pointer dereference at virtual address 0000000000000022
+  pc : [0x…] bbr3_main+0xec/0xc7c        lr : bbr3_main+0xe8/0xc7c
+  Call trace: … tcp_ack+0xe40/0x1378 -> bbr3_main+0xec/0xc7c
+  Internal error: Oops: 96000006 [#2] PREEMPT SMP
+  ```
+
+  v10 sets `CONFIG_DEFAULT_TCP_CONG="bbr3"`, so **every** TCP socket selects bbr3
+  during boot and hits the broken path within a minute of uptime; `mrdump` turns
+  the panic into a reboot, which is what a "bootloop" looked like here.
+
+  Confirmed by diffing the **stock** kernel's own config (recovered from the
+  `IKCFG_ST` blob embedded in the stock `boot_b` image) against v10's config
+  (recovered the same way from v10's `Image`):
+
+  | option | stock (boots) | v10 (bootloop) |
+  |---|---|---|
+  | `CONFIG_DEFAULT_TCP_CONG` | `"westwood"` | `"bbr3"` |
+  | `CONFIG_HZ` | `250` | `300` |
+  | `CONFIG_TCP_CONG_BBR3` | *absent* | `y` |
+
+  Nothing else functional differed (only `TCP_CONG_BIC`, `NET_SCH_CAKE` and the
+  expected KernelSU/SUSFS additions). **Fix shipped in v11:** bbr3 stays compiled
+  in but is no longer the default — `CONFIG_DEFAULT_WESTWOOD=y` +
+  `CONFIG_DEFAULT_TCP_CONG="westwood"`, exactly the stock base — and `HZ` goes
+  back to 250 (`HZ` is baked into the jiffies conversions the vendor modules use,
+  so it is not free to change). bbr3 remains opt-in:
+  `sysctl -w net.ipv4.tcp_congestion_control=bbr3`, until the port itself is
+  validated. **Aetherium ships a *different, working* BBRv3** (same 5.10.269
+  base, `5.10.269-Aetherium4.5`, bbr3 as default) and is the reference to port
+  from rather than re-deriving the fix.
+
+  Two theories ruled out, for the record:
+  * **module vermagic / localversion** — the device's `/vendor/lib/modules` carry
+    `vermagic=5.10.209-android12-9-…` yet load fine on a 5.10.269 kernel, so
+    version matching is not enforced here; a custom `LOCALVERSION` is safe.
+  * **`TRIM_UNUSED_KSYMS`** — its `UNUSED_KSYMS_WHITELIST`
+    (`out/android12-5.10/common/abi_symbollist.raw`) does resolve at build time
+    on both the VPS and CI.
+
+  Also worth knowing when diagnosing a non-booting kernel here: the phone's
+  stock config **also** has `# CONFIG_PID_NS is not set`, `# CONFIG_USER_NS is not
+  set`, `# CONFIG_DEVTMPFS is not set` and `# CONFIG_SYSVIPC is not set` — those
+  are *not* required on this device, even though other 5.10.269 kernels (e.g.
+  Aetherium) enable them.
+
+* **BBRv3 — ported, but not default-safe yet.** Aetherium's BBRv3 is a single **kitchen-sink commit**: it
   also bundles an entire SUSFS implementation (`fs/*`, `security/selinux/*`,
   `kernel/*`, `mm/*`), which would collide with the official SUSFS patch. It also
   conflicts in 11 files on `chihiro-rebase` because Chihiro already carries the

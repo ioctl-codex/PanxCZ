@@ -390,11 +390,28 @@ if [ "${VARIANT}" != "B-susfs-hiding" ]; then
   printf '%s\n' \
     "" \
     "# ---- PanxCZ: responsiveness / gaming (Helio G99) ----" \
-    "CONFIG_HZ_300=y" \
-    "CONFIG_HZ=300" \
+    "# HZ stays 250: that is what the stock PanxCZ base kernel (and every" \
+    "# proven-working build for this device) runs, and HZ is baked into the" \
+    "# jiffies conversions the vendor modules use, so it is not free to change." \
+    "CONFIG_HZ_250=y" \
+    "CONFIG_HZ=250" \
+    "# CONFIG_HZ_300 is not set" \
     "CONFIG_NET_SCH_FQ=y" \
     >> "${DEFCONFIG}"
-  # BBRv3 only becomes the default when the port actually landed.
+  # BBRv3 is compiled in, but deliberately NOT the default congestion control.
+  #
+  # v10 shipped CONFIG_DEFAULT_TCP_CONG="bbr3", so every TCP socket selected
+  # bbr3 during boot, and the port Oopses in bbr3_main ~48s into a boot:
+  #
+  #   Unable to handle kernel NULL pointer dereference at virtual address 0000000000000022
+  #   pc : bbr3_main+0xec/0xc7c     (tcp_ack -> bbr3_main)
+  #   Internal error: Oops: 96000006 [#2] PREEMPT SMP
+  #
+  # mrdump then reboots the phone, which looks exactly like a bootloop. The
+  # stock base kernel runs default "westwood", so that is pinned back here and
+  # bbr3 stays available but opt-in:
+  #   sysctl -w net.ipv4.tcp_congestion_control=bbr3
+  #
   # NOTE: the Kconfig symbol is written as `config TCP_CONG_BBR3`, NOT
   # `CONFIG_TCP_CONG_BBR3` - grepping for the CONFIG_ form silently never
   # matched and left BBRv3 disabled. BBR3 also depends on TCP_CONG_ADVANCED.
@@ -402,11 +419,12 @@ if [ "${VARIANT}" != "B-susfs-hiding" ]; then
     printf '%s\n' \
       "CONFIG_TCP_CONG_ADVANCED=y" \
       "CONFIG_TCP_CONG_BBR3=y" \
+      "# CONFIG_DEFAULT_BBR3 is not set" \
       "# CONFIG_DEFAULT_BBR is not set" \
-      "CONFIG_DEFAULT_BBR3=y" \
-      'CONFIG_DEFAULT_TCP_CONG="bbr3"' \
+      "CONFIG_DEFAULT_WESTWOOD=y" \
+      'CONFIG_DEFAULT_TCP_CONG="westwood"' \
       >> "${DEFCONFIG}"
-    echo "OK: BBRv3 enabled as default congestion control"
+    echo "OK: BBRv3 compiled in but NOT default (default = westwood, as the stock base)"
   else
     warn "BBRv3 Kconfig entry not found - base default congestion control kept"
   fi
