@@ -11,6 +11,7 @@ running **GKI 5.10 / android12-5.10 / KMI generation 9** (Android 17 + Infinity 
 | Layer | Project | Where |
 |---|---|---|
 | Kernel base | **MillenniumOSS Chihiro** (`android_kernel_common_android12-5.10`, branch `chihiro-lnx-stable`, 5.10.264) | https://github.com/MillenniumOSS/android_kernel_common_android12-5.10 |
+| Base refresh | AOSP `android12-5.10-lts` (5.10.269) merged into Chihiro → branch `panxcz-base-5.10.269`, recreated on demand by `scripts/make-base-269.sh` | https://android.googlesource.com/kernel/common |
 | Perf source (ported) | **Aetherium** (`kaminarich/GKI-Kernel`, branch `aetherium`) — BBRv3 | https://github.com/kaminarich/GKI-Kernel |
 | Root | **BakaSU** (ex-ReSukiSU) | https://github.com/Baka-SU/BakaSU |
 | Hiding | **SUSFS** (gki-android12-5.10) | https://gitlab.com/simonpunk/susfs4ksu |
@@ -26,12 +27,16 @@ Build on a Linux host (a VPS is used — the source tree is ~1.2 GB and a full
 `LTO=thin` build wants ≥ 6 cores / 16 GB RAM + swap).
 
 ```bash
-# as root, Ubuntu 22.04
-VARIANT=A-full-allin \
-BASE_BRANCH=chihiro-rebase \
-BBRV3=yes \
-bash scripts/build-panxcz.sh
+# as root, Ubuntu 22.04; the script installs its own deps + swap
+VARIANT=A-full-allin BBRV3=yes LTS_MERGE=yes bash scripts/build-panxcz.sh
 ```
+
+The script is fully self-contained and reproducible: it takes the AOSP manifest
+(`build/` + prebuilts), replaces `common/` with the Chihiro base, rebuilds the
+**5.10.269** base itself (`LTS_MERGE=yes`, the default), ports BBRv3, clones
+BakaSU, applies the SUSFS kernel-side patch, rebrands, injects the defconfig and
+builds `LTO=thin`. Nothing has to be prepared by hand, which is why the same
+script backs the GitHub Actions workflow.
 
 Outputs land in `/opt/panxcz/out-artifacts/`:
 
@@ -44,8 +49,9 @@ summary.txt
 ### Env knobs
 
 `KERNEL_NAME`, `KERNEL_RELEASE`, `VARIANT` (`A-full-allin` | `B-susfs-hiding` |
-`C-charging-gaming`), `LTO_MODE`, `BASE_REPO`, `BASE_BRANCH`, `BBRV3`
-(`auto` | `yes` | `no`), `SUSFS_BRANCH`, `BAKASU_REF`, `WORKDIR`, `BUILD_NUM`.
+`C-charging-gaming`), `LTO_MODE`, `BASE_REPO`, `BASE_BRANCH`, `LTS_MERGE`,
+`LTS_BASE_BRANCH`, `BBRV3` (`auto` | `yes` | `no`), `SUSFS_BRANCH`, `BAKASU_REF`,
+`WORKDIR`, `BUILD_NUM`.
 
 ## Build history
 
@@ -55,7 +61,9 @@ summary.txt
 | v2 | Millennium `chihiro-rebase` (5.10.257) + BakaSU + SUSFS | ✅ Image 37 MB — `PanxCZ-2.0.202610060510` |
 | v3 | same as v2, BBRv3 auto-skipped | ❌ cherry-pick conflicted, rolled back |
 | v4 | `chihiro-rebase` + BBRv3 patch | ❌ `tp->plb_rehash` missing — patch wrongly replaced `include/linux/tcp.h` |
-| v5 | `chihiro-lnx-stable` (5.10.264) + BBRv3 + BakaSU + SUSFS | 🔄 building |
+| v5 | `chihiro-lnx-stable` (5.10.264) + BBRv3 + BakaSU + SUSFS | ❌ built, but **SUSFS was absent** (`System.map` had 0 `susfs` symbols) |
+| v9 | `panxcz-base-5.10.269` + BBRv3 + SUSFS KernelSU patch | ❌ `sucompat.c: assigning to 'int' from incompatible type 'void'` |
+| **v10** | `panxcz-base-5.10.269` + BBRv3 + **BakaSU `main`** + SUSFS | ✅ **`5.10.269-PanxCZ-4.0.202610060802`** — Image 37 MB, AnyKernel3 19 MB, 27 `bbr3` + **89 `susfs`** symbols |
 
 ### Base selection
 
@@ -80,6 +88,62 @@ MillenniumOSS branch survey (LTS level / heads):
 All of the above ship `CONFIG_CPU_FREQ_GOV_REFLEX`, `CONFIG_MQ_IOSCHED_ADIOS` and DAMON.
 **No MillenniumOSS branch is at 5.10.269** — the device's `5.10.269-KagamiChihiro` comes
 from elsewhere.
+
+## SUSFS integration (this is where v5/v9 went wrong)
+
+BakaSU ships SUSFS as a **first-class hook method**. `kernel/Kconfig` already
+offers `KSU_TRACEPOINT_HOOK` (default) / `KSU_MANUAL_HOOK` / **`KSU_SUSFS`** as a
+`choice`, `kernel/core/init.c` already calls `susfs_init()` under
+`#ifdef CONFIG_KSU_SUSFS`, and `kernel/Kbuild` selects
+`tools/inline_hook_check.mk` + `tools/susfs_compat.mk` and then
+**hard-errors** unless `fs/susfs.c` exists:
+
+```
+-- You have not integrated susfs in your kernel yet.
+*** You should integrate susfs in your kernel.
+```
+
+So the only kernel-side work is simonpunk's patch. What must **not** be done is
+applying its companion `kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch`:
+that patch is generated as *"current KernelSU → SUSFS tree built on an older
+KernelSU"*, so alongside the SUSFS additions it also **reverts** the current hook
+infrastructure (`ksu_late_loaded`, the x86 indirect-safe guard, `hook/lsm_hook.o`,
+`hook/syscall_hook_manager.o`, `infra/symbol_resolver.o`, `hook/arm64/*`) and
+rewrites `init.c` back to the pre-hook-manager design. It touches 26 files
+(‑1012 lines, including ‑425 lines of `selinux_hide.c`) and fails to compile.
+
+That single mistake explains two failed builds:
+
+* **v5** never enabled `CONFIG_KSU_SUSFS` at all (no Kconfig symbol → every
+  `CONFIG_KSU_SUSFS_*` defconfig line silently dropped → 0 `susfs` symbols);
+* **v9** applied the KernelSU patch and got
+  `drivers/kernelsu/feature/sucompat.c: assigning to 'int' from incompatible type 'void'`.
+
+What the build does now:
+
+1. **Force a real BakaSU checkout.** `git clean -fdx` never removes a directory
+   containing its own `.git`, so a `KernelSU/` left over from an earlier run
+   survives — and BakaSU's `setup.sh` then only does `git pull` on it. Up to v9
+   that meant we were silently building **SukiSU-Ultra**, not BakaSU. The script
+   now checks `remote get-url origin` and re-clones unless it is `Baka-SU/BakaSU`.
+2. Apply only the kernel-side patch (`fs/`, `include/linux/`, and the
+   `ksu_handle_*` hook points) and fail on any reject.
+3. Assert **before** the 30-minute compile that all seven hooks BakaSU's own
+   `inline_hook_check.mk` looks for are present — `ksu_handle_setresuid`
+   (`kernel/sys.c`), `ksu_handle_execveat` (`fs/exec.c`), `ksu_handle_faccessat`
+   (`fs/open.c`), `ksu_handle_sys_read` (`fs/read_write.c`), `ksu_handle_stat`
+   (`fs/stat.c`), `ksu_handle_sys_reboot` (`kernel/reboot.c`),
+   `ksu_handle_input_handle_event` (`drivers/input/input.c`).
+4. Select the hook method in the defconfig. Because it is a `choice` whose
+   default is the tracepoint hook:
+
+   ```
+   # CONFIG_KSU_TRACEPOINT_HOOK is not set
+   # CONFIG_KSU_MANUAL_HOOK is not set
+   CONFIG_KSU_SUSFS=y
+   ```
+5. Refuse to publish if `System.map` has no `bbr3`/`susfs` symbols or the
+   generated `.config` lost `CONFIG_KSU` / `CONFIG_KSU_SUSFS*`.
 
 ## Known integration issues / notes
 
@@ -120,8 +184,19 @@ from elsewhere.
   * there is no separate per-QPR ABI file to add for 5.10.
 
   Practical consequence: one Image built this way is meant to boot both QPR2 and QPR3
-  ROM builds. The v5 base refresh (5.10.264) narrows the gap to the ROM's 5.10.269.
-  Verifying on-device (both ROM builds) is the only way to actually prove it.
+  ROM builds. Since v10 the base is merged all the way to **5.10.269**, i.e. exactly
+  the level the ROM itself runs, so there is no LTS gap left. Verifying on-device
+  (both ROM builds) is still the only way to actually prove it.
+
+## Where the builds live
+
+* Build system + CI: **https://github.com/ioctl-codex/PanxCZ**
+  (payload only — scripts, patches, workflow; the kernel source is fetched by the
+  script). Pushing to `main` runs the **PanxCZ Kernel Build** workflow, which
+  reproduces a complete build on a stock `ubuntu-22.04` runner.
+* Verified release: **https://github.com/ioctl-codex/PanxCZ/releases/tag/panxcz-4.0-v10**
+  (`Image`, `PanxCZ-4.0.202610060802-AnyKernel3.zip`, `System.map`, `config.txt`, `summary.txt`).
+* Kernel-source fork: **https://github.com/ioctl-codex/GKI-Kernel** (branch `panxcz`).
 
 ## Backup layout (GitLab)
 
