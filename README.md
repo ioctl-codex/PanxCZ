@@ -64,17 +64,72 @@ summary.txt
 | v5 | `chihiro-lnx-stable` (5.10.264) + BBRv3 + BakaSU + SUSFS | ❌ built, but **SUSFS was absent** (`System.map` had 0 `susfs` symbols) |
 | v9 | `panxcz-base-5.10.269` + BBRv3 + SUSFS KernelSU patch | ❌ `sucompat.c: assigning to 'int' from incompatible type 'void'` |
 | **v10** | `panxcz-base-5.10.269` + BBRv3 + **BakaSU `main`** + SUSFS | ⚠️ **`5.10.269-PanxCZ-4.0.202610060802`** built (27 `bbr3` + **89 `susfs`** symbols) but **bootloops on device** — BBRv3 was the default cc |
-| **v11** | v10 with BBRv3 **no longer the default cc** (`westwood`, as the stock base) and `HZ` back to 250 | ✅ builds — see "v10 bootloops" below |
+| **v11** | v10 with BBRv3 **no longer the default cc** (`westwood`, as the stock base) and `HZ` back to 250 | ❌ also **bootloops** — so the default-cc/HZ theory was *not* the (only) cause |
+| v12 | `chihiro-lnx-stable` (legacy repo) with `LTS_MERGE=no` | ⛔ aborted — superseded by the repo discovery below |
+| **v13** | **`millennium/chihiro-main` @ `2a6271bf1f5b` (5.10.269)** + BakaSU + SUSFS, `BBRV3=no` | ✅ `5.10.269-PanxCZ-4.0.202610070010`, 89 `susfs` symbols; config **matches the known-good device kernel** (see below) — but `out/` was reused, so it is not trustworthy |
+| **v14** | v13 with `CLEAN_OUT=yes` (out/ wiped) | building — this is the candidate to flash |
 
-### Base selection
+#### v13 config check (and why v14 exists)
 
-`chihiro-rebase` (5.10.257) was replaced by **`chihiro-lnx-stable` (5.10.264, 2026-08-09)** to
-move toward the level the ROM runs (5.10.269). It is a drop-in: same
-`BRANCH=android12-5.10`, same **`KMI_GENERATION=9`**, same `clang-r416183b`, and all six
-files the BBRv3 patch touches are byte-identical between the two branches, so the patch
-applies cleanly to both.
+`scripts/extract-kernel-config.py` pulls the config back out of a built `Image`
+(handling both raw Images and full boot images). Diffing v13's against
+`patches/config-reference-kagamichihiro-5.10.269.txt` — the config of the kernel
+currently sitting in `boot_b`, identical to MillenniumOSS's prebuilt — gave:
 
-MillenniumOSS branch survey (LTS level / heads):
+```
+config diff: 2 removed, 31 added
+```
+
+and **every** line is expected: the `# Linux/arm64 …` banner, the
+`CONFIG_UNUSED_KSYMS_WHITELIST` build-machine path, the KSU/SUSFS comment blocks,
+and the `CONFIG_KSU*` symbols themselves. No `CONFIG_HZ`, no
+`CONFIG_DEFAULT_TCP_CONG`, no BBRv3, no `CONFIG_LLVM_POLLY` — i.e. the kernel is
+now config-identical to the one that boots, plus root and hiding. That check is
+built into the build as **step 12b** and warns on any unexpected drift, because
+`CONFIG_HZ=300` and `CONFIG_DEFAULT_TCP_CONG="bbr3"` are both perfectly valid
+Kconfig values and nothing else flagged them in v10.
+
+v13 still reuses `out/android12-5.10/common` from earlier builds — `git clean
+-fdx` only cleans the *source* tree — and only 3462 `CC` lines were logged, so
+most objects came from the older legacy-repo tree. Mixing objects and generated
+headers from two different kernels on one link line is not a supported
+configuration, so **v14 rebuilds with `CLEAN_OUT=yes`** (now the default) rather
+than flashing a binary with that doubt attached.
+
+### Base selection — the legacy repo was the bootloop
+
+**The single most important thing on this page.** There are *two* MillenniumOSS
+kernel repos, and only one of them is current:
+
+| repo | branch used | LTS | head date |
+|---|---|---|---|
+| `android_kernel_common_android12-5.10` *(legacy)* | `chihiro-lnx-stable` | 5.10.264 | 2026-08-14 |
+| **`android_kernel_common_millennium_android12-5.10`** | **`chihiro-main`** | **5.10.269** | **2026-10-03** |
+
+Everything up to v12 was built from the **legacy** repo. That was wrong. The
+proof is a prebuilt: MillenniumOSS publishes the device's own kernel in
+`android_device_millennium_common-kernel` (`chihiro/Image.gz`, branch
+`seventeen`), and that binary reports
+
+```
+Linux version 5.10.269-KagamiChihiro-MillenniumTeam-android12-9+
+  (build-user@build-host) ... clang version 12.0.5 ... #1 SMP PREEMPT Sat Oct 3 22:58:56 UTC 2026
+```
+
+`Sat Oct 3 22:58:56 UTC 2026` is the timestamp of `chihiro-main` tip
+`2a6271bf1f5b` (*"Merge branch 'millennium-dev' into chihiro-main"*), so the
+kernel this phone runs is built from that exact commit. Two further checks
+agree: the prebuilt's embedded `IKCFG_ST` config is **byte-identical (0 diff
+lines)** to the config of the kernel currently sitting in `boot_b`, and the
+prebuilt's decompressed `Image` is the same size as `boot_a`'s (38,323,860 B).
+
+So the reference for "what boots on this device" is exactly
+**`millennium/chihiro-main` + stock `gki_defconfig`, with no KSU, no SUSFS and
+no BBRv3.** The v10/v11 builds instead hand-merged AOSP LTS 5.10.269 onto the
+legacy 5.10.264 branch through six manual conflict resolutions — an entirely
+different tree, and the natural place for a boot hang to hide.
+
+Legacy-repo branch survey (kept for reference only — do not build from these):
 
 | branch | LTS | date |
 |---|---|---|
@@ -86,9 +141,15 @@ MillenniumOSS branch survey (LTS level / heads):
 | `kei-5.10` | 5.10.257 | 2026-06-14 |
 | `chihiro-dev` | 5.10.250 | 2026-02-14 |
 
-All of the above ship `CONFIG_CPU_FREQ_GOV_REFLEX`, `CONFIG_MQ_IOSCHED_ADIOS` and DAMON.
-**No MillenniumOSS branch is at 5.10.269** — the device's `5.10.269-KagamiChihiro` comes
-from elsewhere.
+Those ship `CONFIG_CPU_FREQ_GOV_REFLEX` and DAMON; `CONFIG_MQ_IOSCHED_ADIOS` is in the
+legacy `chihiro-rebase` lineage but **not** in the live `chihiro-main`.
+
+**Correction to an earlier claim on this page:** *"no MillenniumOSS branch is at
+5.10.269, so the device's `5.10.269-KagamiChihiro` comes from elsewhere"* was wrong. It
+came from not looking in the second repo. `millennium/chihiro-main` **is** 5.10.269, and
+that is where the device kernel comes from — so no AOSP LTS merge is needed at all
+(`LTS_MERGE=no` is now the default; `scripts/make-base-269.sh` is kept only for the
+legacy path).
 
 ## SUSFS integration (this is where v5/v9 went wrong)
 
@@ -148,7 +209,15 @@ What the build does now:
 
 ## Known integration issues / notes
 
-* **v10 bootloops on device — root cause: BBRv3 as the default congestion control.**
+* **v10/v11 bootloop.** Final verdict: **the base repo was wrong** (see *Base
+  selection* above) — v10 and v11 were built from the legacy
+  `android_kernel_common_android12-5.10` via a hand-resolved AOSP LTS merge, not from
+  the live `millennium/chihiro-main` @ 5.10.269 the device actually runs. v13 is the
+  first build on the correct tree. The BBRv3 story below is kept because the crash is
+  real and bbr3 is still suspected *in addition* — but be clear that v11 removed
+  BBRv3-as-default and **still** bootlooped, so it was never the whole cause.
+
+* **BBRv3 as the default congestion control is a genuine, separate bug.**
   Flashing v10 (both the hand-packed `boot` image and the AnyKernel3 zip) put the
   phone into a reboot loop. There is no log from the v10 kernel itself, but the
   crash is unambiguous — pstore (`/sys/fs/pstore/console-ramoops-0`, dumped as

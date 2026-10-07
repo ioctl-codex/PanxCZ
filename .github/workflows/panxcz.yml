@@ -2,12 +2,16 @@ name: PanxCZ Kernel Build
 
 # Drives scripts/build-panxcz.sh, which does the whole pipeline:
 #   AOSP manifest (build/ + prebuilts)
-#     -> 5.10.269 base (chihiro-lnx-stable merged with AOSP android12-5.10-lts,
-#        created on the runner by scripts/make-base-269.sh)
-#     -> BBRv3 (patches/bbrv3-chihiro.patch)
+#     -> MillenniumOSS `millennium/chihiro-main` @ 2a6271bf1f5b (already 5.10.269,
+#        so no AOSP LTS merge is needed - that merge is what bootlooped v10/v11)
+#     -> BBRv3 (patches/bbrv3-chihiro.patch) [off by default, see below]
 #     -> BakaSU (SUSFS is a first-class hook method there: CONFIG_KSU_SUSFS)
 #     -> simonpunk's SUSFS kernel-side patch (fs/susfs.c + the ksu_handle_* hooks)
 #     -> LTO=thin build -> Image + AnyKernel3 zip
+#
+# BBRv3 defaults to `no` here on purpose: it is compiled in but not the default
+# congestion control, and the chihiro lineage already has a pstore Oops in
+# bbr3_main on record. Get a kernel that boots first, then turn it back on.
 #
 # Keeping the logic in the script (not in YAML) is deliberate: the same script
 # runs on the VPS, so CI and local builds cannot drift apart.
@@ -37,15 +41,15 @@ on:
       bbrv3:
         description: 'BBRv3: yes = fail the build if it cannot be applied'
         required: true
-        default: 'yes'
+        default: 'no'
         type: choice
         options: [yes, auto, no]
       lts_merge:
-        description: 'Create/use the 5.10.269 base (AOSP LTS merge)'
+        description: 'LEGACY ONLY: merge AOSP LTS onto the old repo (leave `no`)'
         required: true
-        default: 'yes'
+        default: 'no'
         type: choice
-        options: [yes, no]
+        options: [no, yes]
       publish_release:
         description: 'Publish a GitHub release with the artifacts'
         required: true
@@ -98,8 +102,12 @@ jobs:
           VARIANT: ${{ inputs.variant || 'A-full-allin' }}
           KERNEL_RELEASE: ${{ inputs.kernel_release || '4.0' }}
           LTO_MODE: ${{ inputs.lto || 'thin' }}
-          BBRV3: ${{ inputs.bbrv3 || 'yes' }}
-          LTS_MERGE: ${{ inputs.lts_merge || 'yes' }}
+          BBRV3: ${{ inputs.bbrv3 || 'no' }}
+          LTS_MERGE: ${{ inputs.lts_merge || 'no' }}
+          # Pin the live tree explicitly so a stale runner cache or a changed
+          # script default can never silently fall back to the legacy repo.
+          BASE_REPO: https://github.com/MillenniumOSS/android_kernel_common_millennium_android12-5.10.git
+          BASE_BRANCH: chihiro-main
           WORKDIR: /opt/panxcz
         run: |
           set -euo pipefail
@@ -107,12 +115,19 @@ jobs:
           sudo -E bash scripts/build-panxcz.sh
           echo "--- verification (must not be empty) ---"
           O=/opt/panxcz/gki/out/android12-5.10/common
-          for p in bbr3 susfs; do
+          probes="susfs"
+          [ "${BBRV3}" = "no" ] || probes="bbr3 susfs"
+          for p in $probes; do
             n=$(grep -ic "$p" "$O/System.map" || true)
             echo "$p symbols: $n"
             [ "$n" -gt 0 ] || { echo "::error::$p missing from System.map"; exit 1; }
           done
-          grep -E '^CONFIG_(TCP_CONG_BBR3|KSU_SUSFS)=y' "$O/.config"
+          grep -q '^CONFIG_KSU_SUSFS=y' "$O/.config"
+          # The base must be 5.10.269 from chihiro-main, not a merged legacy tree.
+          echo -n "base LTS level: "
+          awk '/^(VERSION|PATCHLEVEL|SUBLEVEL) =/{printf "%s.",$3}END{print ""}' \
+            /opt/panxcz/gki/common/Makefile
+          grep '^CONFIG_LOCALVERSION=' "$O/.config" || true
 
       - name: Collect artifacts
         run: |
@@ -144,9 +159,10 @@ jobs:
           body: |
             PanxCZ kernel for the Infinix Note 30 (X6833B) — MediaTek Helio G99 (MT6789).
 
-            Base: MillenniumOSS Chihiro `chihiro-lnx-stable` merged with AOSP
-            `android12-5.10-lts` → **5.10.269**, KMI generation 9.
-            Root: BakaSU (multi-manager) · Hiding: SUSFS · Congestion control: BBRv3.
+            Base: MillenniumOSS Chihiro **`millennium/chihiro-main`**
+            @ `2a6271bf1f5b` → **5.10.269**, KMI generation 9. No AOSP LTS merge
+            (the hand-merged legacy tree bootlooped v10/v11).
+            Root: BakaSU (multi-manager) · Hiding: SUSFS.
 
             Credit: kernel work belongs to MillenniumOSS (Chihiro), Aetherium
             (kaminarich), BakaSU, SUSFS and upstream Linux/AOSP. PanxCZ is a

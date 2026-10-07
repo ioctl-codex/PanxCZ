@@ -50,8 +50,18 @@ DEVICE_MODEL="Infinix Note 30 (X6833B)"
 DEVICE_PLATFORM="MediaTek Helio G99 (MT6789) - GKI 5.10 android12 / KMI gen 9"
 
 # --- base kernel -------------------------------------------------------------
-BASE_REPO="${BASE_REPO:-https://github.com/MillenniumOSS/android_kernel_common_android12-5.10.git}"
-BASE_BRANCH="${BASE_BRANCH:-chihiro-rebase}"
+# The *live* chihiro tree. There are two MillenniumOSS kernel repos and only
+# this one is current:
+#   android_kernel_common_millennium_android12-5.10  chihiro-main  5.10.269  <- here
+#   android_kernel_common_android12-5.10             chihiro-*     5.10.2xx  (legacy)
+# chihiro-main @ 2a6271bf1f5b is the exact source of the kernel this device
+# runs: the "KagamiChihiro" prebuilt that MillenniumOSS ships in
+# android_device_millennium_common-kernel (chihiro/Image.gz) reports
+#   5.10.269-KagamiChihiro-MillenniumTeam-android12-9+ ... Sat Oct 3 22:58:56 UTC 2026
+# which is that commit's timestamp. Building the legacy repo was the whole
+# reason v10/v11 bootlooped.
+BASE_REPO="${BASE_REPO:-https://github.com/MillenniumOSS/android_kernel_common_millennium_android12-5.10.git}"
+BASE_BRANCH="${BASE_BRANCH:-chihiro-main}"
 BASE_NAME="${BASE_NAME:-millennium-chihiro}"
 
 # --- Aetherium: source of perf patches the base lacks ------------------------
@@ -76,8 +86,17 @@ AOSP_MANIFEST="${AOSP_MANIFEST:-https://android.googlesource.com/kernel/manifest
 AOSP_BRANCH="${AOSP_BRANCH:-common-android12-5.10}"
 VARIANT="${VARIANT:-A-full-allin}"
 LTO_MODE="${LTO_MODE:-thin}"
+# Wipe out/android12-5.10/common before compiling. The VPS keeps ONE tree for
+# many builds, and `git clean -fdx` only cleans the *source* tree - out/ is left
+# alone. Reusing it across a changed base or a changed .config mixes objects and
+# generated headers from two different kernels on the same link line, which is
+# not a supported configuration and is a plausible source of a kernel that
+# hangs. Default is the safe one; CLEAN_OUT=no is an explicit speed opt-in.
+CLEAN_OUT="${CLEAN_OUT:-yes}"
 # 5.10.269 base: chihiro-lnx-stable merged with AOSP android12-5.10-lts.
-LTS_MERGE="${LTS_MERGE:-yes}"
+# chihiro-main is already 5.10.269, so merging AOSP LTS onto a legacy branch is
+# no longer needed (and the hand-resolved merge was a bootloop suspect).
+LTS_MERGE="${LTS_MERGE:-no}"
 LTS_BASE_BRANCH="${LTS_BASE_BRANCH:-panxcz-base-5.10.269}"
 LTS_SOURCE_BRANCH="${LTS_SOURCE_BRANCH:-chihiro-lnx-stable}"
 WORKDIR="${WORKDIR:-/opt/panxcz}"
@@ -432,8 +451,16 @@ fi
 tail -30 "${DEFCONFIG}"
 
 # ---------------------------------------------------------------- 11. build
-log "Step 11/12 - build (LTO=${LTO_MODE}, jobs=$(nproc))"
+log "Step 11/12 - build (LTO=${LTO_MODE}, jobs=$(nproc), CLEAN_OUT=${CLEAN_OUT})"
 cd "${GKI}"
+if [ "${CLEAN_OUT}" = "yes" ]; then
+  OUT_COMMON="${GKI}/out/android12-5.10/common"
+  if [ -d "${OUT_COMMON}" ]; then
+    log "Step 11a/12 - wiping stale build output (${OUT_COMMON})"
+    rm -rf "${OUT_COMMON}"
+  fi
+  echo "OK: clean build from scratch"
+fi
 LTO="${LTO_MODE}" BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh
 
 # ---------------------------------------------------------------- 12. package
@@ -451,7 +478,9 @@ echo "Kernel version: ${KVER}${EXTRA}"
 SYSMAP="$(find "${GKI}/out" -name System.map | head -n1)"
 if [ -n "${SYSMAP}" ]; then
   SYSMAP_FAIL=""
-  for probe in bbr3 susfs; do
+  PROBES="susfs"
+  [ "${BBRV3}" = "no" ] || PROBES="bbr3 susfs"
+  for probe in ${PROBES}; do
     n="$(grep -ic "${probe}" "${SYSMAP}" 2>/dev/null || echo 0)"
     if [ "${n}" -gt 0 ]; then
       echo "OK: ${n} '${probe}' symbols in System.map"
@@ -478,6 +507,35 @@ done
 grep -q '^CONFIG_DEFAULT_TCP_CONG="bbr3"' "${OCFG}" 2>/dev/null \
   && echo "OK: BBRv3 is the default congestion control" \
   || warn "BBRv3 is not the default congestion control"
+
+# --- drift check against the kernel this device actually boots ---------------
+# The reference is the config embedded in the "KagamiChihiro" kernel that
+# MillenniumOSS ships for exactly this device (android_device_millennium_common-kernel,
+# chihiro/Image.gz, 5.10.269) - i.e. the config *known to boot here*. Diffing
+# against it is what catches the regressions that cost v10/v11: those shipped
+# CONFIG_HZ=300 and CONFIG_DEFAULT_TCP_CONG="bbr3", and nothing flagged them,
+# because both are perfectly valid Kconfig values.
+REFCFG="${SCRIPT_DIR}/../patches/config-reference-kagamichihiro-5.10.269.txt"
+if [ -f "${REFCFG}" ] && command -v python3 >/dev/null 2>&1; then
+  log "Step 12b/12 - drift check vs the known-good device config"
+  ACTUAL=/tmp/panxcz-actual-config.txt
+  if python3 "${SCRIPT_DIR}/extract-kernel-config.py" "${IMAGE}" -o "${ACTUAL}" >/dev/null 2>&1 \
+     && [ -s "${ACTUAL}" ]; then
+    # Expected additions and build-machine paths are not drift. Comments are
+    # skipped - the version banner always differs.
+    DRIFT="$(diff <(sort "${REFCFG}") <(sort "${ACTUAL}") | grep -E '^[<>]' \
+             | grep -vE '^[<>] (CONFIG_KSU|# CONFIG_KSU|CONFIG_UNUSED_KSYMS_WHITELIST)' \
+             | grep -vE '^[<>] #' || true)"
+    if [ -z "${DRIFT}" ]; then
+      echo "OK: config matches the known-good device kernel (modulo KSU/SUSFS)"
+    else
+      warn "config drift vs the known-good device kernel:"
+      printf '%s\n' "${DRIFT}" | sed 's/^/    /'
+    fi
+  else
+    warn "could not extract the config from ${IMAGE} - drift check skipped"
+  fi
+fi
 
 # --- AnyKernel3 -------------------------------------------------------------
 # Packaging lives in its own script (scripts/make-anykernel3.sh) so the zip can
