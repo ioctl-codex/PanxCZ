@@ -86,6 +86,15 @@ AOSP_MANIFEST="${AOSP_MANIFEST:-https://android.googlesource.com/kernel/manifest
 AOSP_BRANCH="${AOSP_BRANCH:-common-android12-5.10}"
 VARIANT="${VARIANT:-A-full-allin}"
 LTO_MODE="${LTO_MODE:-thin}"
+# Root/hiding are separately switchable so the two can be bisected against each
+# other. v14 (both on) boots *recovery* perfectly but Android never comes up, so
+# the suspect set is small and this is how we split it in one build each:
+#   ROOT_KSU=no SUSFS=no  -> control: should be the stock kernel, proves the
+#                            tree + pipeline; no root, no hiding.
+#   ROOT_KSU=yes SUSFS=no -> is it SUSFS' path/stat/mount hooks (which Android
+#                            hammers and recovery barely touches)?
+ROOT_KSU="${ROOT_KSU:-yes}"   # yes | no
+SUSFS="${SUSFS:-yes}"         # yes | no
 # Wipe out/android12-5.10/common before compiling. The VPS keeps ONE tree for
 # many builds, and `git clean -fdx` only cleans the *source* tree - out/ is left
 # alone. Reusing it across a changed base or a changed .config mixes objects and
@@ -106,7 +115,10 @@ SWAP_GB="${SWAP_GB:-8}"
 
 EXTRA="-${KERNEL_NAME}-${KERNEL_RELEASE}.${BUILD_NUM}"
 ZIPNAME="${KERNEL_NAME}-${KERNEL_RELEASE}.${BUILD_NUM}-AnyKernel3.zip"
-OUTDIR="${WORKDIR}/out-artifacts"
+# Overridable so bisect runs can keep their artifacts apart (the zip name does
+# not encode ROOT_KSU/SUSFS, so a shared OUTDIR silently overwrites the previous
+# candidate's Image).
+OUTDIR="${OUTDIR:-${WORKDIR}/out-artifacts}"
 GKI="${WORKDIR}/gki"
 COMMON="${GKI}/common"
 
@@ -301,7 +313,7 @@ sed -i 's|^POST_DEFCONFIG_CMDS=.*|POST_DEFCONFIG_CMDS=""|' build.config.gki
 cat build.config.gki
 
 # ---------------------------------------------------------------- 8. root
-if [ "${VARIANT}" != "C-charging-gaming" ]; then
+if [ "${VARIANT}" != "C-charging-gaming" ] && [ "${ROOT_KSU}" != "no" ]; then
   log "Step 8/12 - integrate BakaSU"
   curl -fsSL "https://raw.githubusercontent.com/Baka-SU/BakaSU/${BAKASU_REF}/kernel/setup.sh" > /tmp/bakasu-setup.sh
   # `git clean -fdx` never removes a directory that contains its own .git, so a
@@ -328,11 +340,11 @@ if [ "${VARIANT}" != "C-charging-gaming" ]; then
     bash "${SCRIPT_DIR}/fix-bakasu-version.sh" "$PWD" || true
   fi
 else
-  log "Step 8/12 - skipped (variant ${VARIANT})"
+  log "Step 8/12 - skipped (variant ${VARIANT}, ROOT_KSU=${ROOT_KSU})"
 fi
 
 # ---------------------------------------------------------------- 9. susfs
-if [ "${VARIANT}" != "C-charging-gaming" ]; then
+if [ "${VARIANT}" != "C-charging-gaming" ] && [ "${SUSFS}" != "no" ]; then
   log "Step 9/12 - integrate SUSFS (${SUSFS_BRANCH})"
   # BakaSU ships SUSFS as a first-class *hook method*: CONFIG_KSU_SUSFS selects
   # tools/inline_hook_check.mk + tools/susfs_compat.mk, calls susfs_init() from
@@ -372,38 +384,42 @@ if [ "${VARIANT}" != "C-charging-gaming" ]; then
   done
   echo "OK: SUSFS kernel-side hooks verified"
 else
-  log "Step 9/12 - skipped (variant ${VARIANT})"
+  log "Step 9/12 - skipped (variant ${VARIANT}, SUSFS=${SUSFS})"
 fi
 
 # ---------------------------------------------------------------- 10. defconfig
 log "Step 10/12 - inject defconfig"
 DEFCONFIG=arch/arm64/configs/gki_defconfig
-if [ "${VARIANT}" != "C-charging-gaming" ]; then
+if [ "${VARIANT}" != "C-charging-gaming" ] && [ "${ROOT_KSU}" != "no" ]; then
   printf '%s\n' \
     "" \
-    "# ---- PanxCZ: root + SUSFS hiding ----" \
+    "# ---- PanxCZ: root ----" \
     "CONFIG_KSU=y" \
     "CONFIG_KSU_MULTI_MANAGER_SUPPORT=y" \
-    "# KernelSU hooking method: SUSFS' inline hook (BakaSU default is" \
-    "# CONFIG_KSU_TRACEPOINT_HOOK, so the choice has to be switched explicitly)" \
-    "# CONFIG_KSU_TRACEPOINT_HOOK is not set" \
-    "# CONFIG_KSU_MANUAL_HOOK is not set" \
-    "CONFIG_KSU_SUSFS=y" \
-    "CONFIG_KSU_SUSFS_SUS_PATH=y" \
-    "CONFIG_KSU_SUSFS_SUS_MOUNT=y" \
-    "CONFIG_KSU_SUSFS_SUS_KSTAT=y" \
-    "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" \
-    "CONFIG_KSU_SUSFS_ENABLE_LOG=y" \
-    "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" \
-    "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" \
-    "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" \
-    "CONFIG_KSU_SUSFS_SUS_MAP=y" \
     >> "${DEFCONFIG}"
-  # (AUTO_ADD_SUS_*, SUS_SU and TRY_UMOUNT were dropped from SUSFS' Kconfig a
-  # while ago; listing them only produced silent no-ops.)
-  # CONFIG_KSU_SUSFS depends on THREAD_INFO_IN_TASK.
-  grep -q '^CONFIG_THREAD_INFO_IN_TASK=y' "${DEFCONFIG}" \
-    || printf '%s\n' 'CONFIG_THREAD_INFO_IN_TASK=y' >> "${DEFCONFIG}"
+  if [ "${SUSFS}" != "no" ]; then
+    # KernelSU hooking method: SUSFS' inline hook (BakaSU's default is
+    # CONFIG_KSU_TRACEPOINT_HOOK, so the choice has to be switched explicitly).
+    printf '%s\n' \
+      "CONFIG_KSU_SUSFS=y" \
+      "CONFIG_KSU_SUSFS_SUS_PATH=y" \
+      "CONFIG_KSU_SUSFS_SUS_MOUNT=y" \
+      "CONFIG_KSU_SUSFS_SUS_KSTAT=y" \
+      "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" \
+      "CONFIG_KSU_SUSFS_ENABLE_LOG=y" \
+      "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" \
+      "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" \
+      "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" \
+      "CONFIG_KSU_SUSFS_SUS_MAP=y" \
+      "# CONFIG_KSU_TRACEPOINT_HOOK is not set" \
+      "# CONFIG_KSU_MANUAL_HOOK is not set" \
+      >> "${DEFCONFIG}"
+    # (AUTO_ADD_SUS_*, SUS_SU and TRY_UMOUNT were dropped from SUSFS' Kconfig a
+    # while ago; listing them only produced silent no-ops.)
+    # CONFIG_KSU_SUSFS depends on THREAD_INFO_IN_TASK.
+    grep -q '^CONFIG_THREAD_INFO_IN_TASK=y' "${DEFCONFIG}" \
+      || printf '%s\n' 'CONFIG_THREAD_INFO_IN_TASK=y' >> "${DEFCONFIG}"
+  fi
 fi
 if [ "${VARIANT}" != "B-susfs-hiding" ]; then
   printf '%s\n' \
@@ -478,8 +494,11 @@ echo "Kernel version: ${KVER}${EXTRA}"
 SYSMAP="$(find "${GKI}/out" -name System.map | head -n1)"
 if [ -n "${SYSMAP}" ]; then
   SYSMAP_FAIL=""
-  PROBES="susfs"
-  [ "${BBRV3}" = "no" ] || PROBES="bbr3 susfs"
+  # Only assert the features this run actually asked for - a bisect build that
+  # deliberately omits SUSFS must not be failed for not containing it.
+  PROBES=""
+  [ "${SUSFS}" = "no" ] || PROBES="${PROBES} susfs"
+  [ "${BBRV3}" = "no" ] || PROBES="${PROBES} bbr3"
   for probe in ${PROBES}; do
     n="$(grep -ic "${probe}" "${SYSMAP}" 2>/dev/null || echo 0)"
     if [ "${n}" -gt 0 ]; then
@@ -495,7 +514,10 @@ if [ -n "${SYSMAP}" ]; then
 fi
 OCFG="${GKI}/out/android12-5.10/common/.config"
 CFG_FAIL=""
-for sym in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH CONFIG_KSU_SUSFS_SUS_MOUNT; do
+CFG_WANT=""
+[ "${ROOT_KSU}" = "no" ] || CFG_WANT="${CFG_WANT} CONFIG_KSU"
+[ "${SUSFS}" = "no" ] || CFG_WANT="${CFG_WANT} CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH CONFIG_KSU_SUSFS_SUS_MOUNT"
+for sym in ${CFG_WANT}; do
   if grep -q "^${sym}=y" "${OCFG}" 2>/dev/null; then
     echo "OK: ${sym}=y in .config"
   else
@@ -504,6 +526,9 @@ for sym in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH CONFIG_KSU_SUSF
   fi
 done
 [ -z "${CFG_FAIL}" ] || die "root/hiding config lost:${CFG_FAIL}"
+if [ "${ROOT_KSU}" = "no" ] || [ "${SUSFS}" = "no" ]; then
+  echo "NOTE: bisect build - ROOT_KSU=${ROOT_KSU} SUSFS=${SUSFS}"
+fi
 grep -q '^CONFIG_DEFAULT_TCP_CONG="bbr3"' "${OCFG}" 2>/dev/null \
   && echo "OK: BBRv3 is the default congestion control" \
   || warn "BBRv3 is not the default congestion control"
@@ -523,9 +548,11 @@ if [ -f "${REFCFG}" ] && command -v python3 >/dev/null 2>&1; then
      && [ -s "${ACTUAL}" ]; then
     # Expected additions and build-machine paths are not drift. Comments are
     # skipped - the version banner always differs.
+    # `^[<>] #` drops comment banners, `^[<>] *$` drops the blank separator
+    # lines that come with the extra KernelSU/SUSFS config sections.
     DRIFT="$(diff <(sort "${REFCFG}") <(sort "${ACTUAL}") | grep -E '^[<>]' \
              | grep -vE '^[<>] (CONFIG_KSU|# CONFIG_KSU|CONFIG_UNUSED_KSYMS_WHITELIST)' \
-             | grep -vE '^[<>] #' || true)"
+             | grep -vE '^[<>] #' | grep -vE '^[<>][[:space:]]*$' || true)"
     if [ -z "${DRIFT}" ]; then
       echo "OK: config matches the known-good device kernel (modulo KSU/SUSFS)"
     else

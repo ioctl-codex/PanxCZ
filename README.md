@@ -67,7 +67,99 @@ summary.txt
 | **v11** | v10 with BBRv3 **no longer the default cc** (`westwood`, as the stock base) and `HZ` back to 250 | ❌ also **bootloops** — so the default-cc/HZ theory was *not* the (only) cause |
 | v12 | `chihiro-lnx-stable` (legacy repo) with `LTS_MERGE=no` | ⛔ aborted — superseded by the repo discovery below |
 | **v13** | **`millennium/chihiro-main` @ `2a6271bf1f5b` (5.10.269)** + BakaSU + SUSFS, `BBRV3=no` | ✅ `5.10.269-PanxCZ-4.0.202610070010`, 89 `susfs` symbols; config **matches the known-good device kernel** (see below) — but `out/` was reused, so it is not trustworthy |
-| **v14** | v13 with `CLEAN_OUT=yes` (out/ wiped) | building — this is the candidate to flash |
+| **v14** | v13 with `CLEAN_OUT=yes` (out/ wiped) | ✅ `5.10.269-PanxCZ-4.0.202610070028`, Image 38,651,708 B md5 `45f98e8dbe04a8631a3092609c7dcebd`, 2859/2859 objects rebuilt from scratch, **zero unexpected config drift** — candidate to flash |
+
+#### v14 booted *recovery* — Android is what fails
+
+v14 was flashed to `boot_b` and the phone then sat in recovery, and that turned
+out to be the most useful thing all session: **recovery runs the v14 kernel.**
+
+```
+$ adb shell uname -r
+5.10.269-PanxCZ-4.0.202610070028
+$ adb shell 'wc -l < /proc/modules'      # 201 vendor modules loaded
+$ adb shell dmesg | tail                 # rt9471 charger, mt635x-auxadc, mtk_crtc, cmdq all live
+$ adb shell id                           # uid=0 — recovery adbd is root
+```
+
+So the flash path, the boot-image repack, the AVB relocation, the kernel binary
+and the vendor modules are **all fine**. What fails is Android specifically, and
+`/proc/bootconfig` says `androidboot.bootreason = "kernel_panic"`.
+
+Both crash stores were checked and neither holds a log from v14:
+
+* `/sys/fs/pstore/console-ramoops-0` (256 KB, `ramoops.console_size=0x40000` from
+  the cmdline) still contains the *old* `5.10.260-KagamiChihiro-MillenniumTeam+`
+  bbr3 crash. A console record is only written from a `kmsg_dump` (panic/oops),
+  so an untouched record means v14 did **not** panic with a dump.
+* `/dev/block/by-name/expdb` (128 MB — MTK's AEE exception dumper) contains only
+  that same old 5.10.260 log: `bbr3` x27, `KagamiChihiro` x23, `PanxCZ` x0.
+
+=> it is a **hang + watchdog reset**, not a panic. (For the record, that same
+old log is also positive evidence: that 5.10.260 kernel — a *different* build —
+drove `system_server` and a camera EEPROM probe before dying in `bbr3_main` at
+48 s, i.e. the chihiro lineage does fully boot Android here.)
+
+Two theories were checked and **dropped**:
+
+* *module vermagic / uname-derived module path* — `/lib/modules` is a **flat**
+directory (no `uname -r` subdir), and 201 modules load, so `uname -r` is
+irrelevant here.
+* *symbol-version mismatch* — our kernel logs 3653 `disagrees about version of
+symbol ..., but ignore...` lines, which looked damning. But the working
+5.10.260 log only covers t=22→48 s, so it never covers module load at t≈0.65 s;
+the absence there proves nothing. MTK patches the check to warn-and-continue by
+design, so this is not evidence of a fault.
+
+#### ReSukiSU *is* BakaSU
+
+Worth stating plainly because it invalidates a whole class of fix: `ReSukiSU/ReSukiSU`
+**redirects to `Baka-SU/BakaSU`** — ReSukiSU was renamed, and the project still
+ships its manager as `ReSukiSU_v4.2.0-rc3_*.apk`. "Switch to ReSukiSU" therefore
+rebuilds the same root solution. The real delta against Aetherium (which boots
+here) is only the *revision*: our kernel reports manager version code **35216**
+while the newest published APK is **35171**.
+
+Also checked: Aetherium's tree does **not** vendor KernelSU/SUSFS (`fs/susfs.c`
+and `drivers/kernelsu` are both absent on `kaminarich/GKI-Kernel@aetherium`), so
+they integrate it the same way we do. Their tree *does* add options ours cannot
+have, notably `CONFIG_CFI_FORCE_SKIP_CHECK=y` — that symbol exists only in their
+tree, so it is a patch there, not a knob we can flip.
+
+#### Bisecting: `ROOT_KSU` / `SUSFS`
+
+A hang that spares recovery but breaks Android points at the `execveat` /
+path / stat hooks, which Android hammers constantly and recovery barely touches.
+Builds are only ~10 min, so `scripts/build-panxcz.sh` now takes `ROOT_KSU=` and
+`SUSFS=` knobs to split that in one build each:
+
+| build | `ROOT_KSU` | `SUSFS` | Image size | identity | purpose |
+|---|---|---|---|---|---|
+| v15 | yes | **no** | 38,389,588 | `5.10.269-PanxCZ-4.0.202610070309` md5 `b2d09ce8db210451702eaef57cf821f6` | is SUSFS' hiding (path/stat/mount) the culprit? |
+| v16 | **no** | no | **38,323,860** | `5.10.269-PanxCZ-4.0.202610070318` md5 `9fef438bd04f45c17b68e62beb05ba21` | control — must boot; proves tree + pipeline |
+
+(`OUTDIR` is now overridable too, because the zip name does not encode these
+knobs and a shared output dir silently overwrites the previous candidate.)
+
+**v16 lands the control perfectly.** Its `Image` is 38,323,860 bytes — *the same
+size as the MillenniumOSS prebuilt* `chihiro/Image.gz` — and its config differs
+from the known-good device config by **2 lines, both cosmetic** (the version
+banner, and the `UNUSED_KSYMS_WHITELIST` build path). v16 therefore *is* the
+kernel the phone runs, rebuilt by our pipeline with only the branding changed.
+
+The sizes tell the whole story:
+
+```
+stock / v16    38,323,860        
+v15 (+KSU)     38,389,588   (+65,728 = 64 KiB + 1 KiB)
+v14 (+KSU+SUSFS) 38,651,708  (+327,848)
+```
+
+So the bisect reads directly: v16 must boot (nothing but branding changed from a
+kernel that already boots), **v15 then isolates root from hiding** — if v15
+boots, SUSFS is the culprit; if it also hangs, KernelSU itself is, and the
+remaining lever is the BakaSU revision (our manager version code is 35216, the
+newest published APK is 35171).
 
 #### v13 config check (and why v14 exists)
 
